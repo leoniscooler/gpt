@@ -1,6 +1,8 @@
 import streamlit as st
 from openai import OpenAI
+import httpx
 import uuid
+import hashlib
 
 # ──────────────────────────────────────────────
 # Page configuration
@@ -199,23 +201,55 @@ hr {
 )
 
 # ──────────────────────────────────────────────
-# Available models
+# Available models (mapped per-provider)
 # ──────────────────────────────────────────────
 MODELS = {
-    "GPT-4.1 mini": "openai",
-    "GPT-4.1": "openai-large",
-    "Llama 3.3 70B": "llama",
-    "Mistral Large": "mistral-large",
-    "DeepSeek V3": "deepseek",
-    "DeepSeek R1": "deepseek-r1",
+    "GPT-4.1 mini": {
+        "pollinations": "openai",
+        "cablyai": "gpt-4.1-mini",
+        "fresedgpt": "gpt-4.1-mini",
+    },
+    "GPT-4.1": {
+        "pollinations": "openai-large",
+        "cablyai": "gpt-4.1",
+        "fresedgpt": "gpt-4.1",
+    },
+    "Llama 3.3 70B": {
+        "pollinations": "llama",
+        "cablyai": "llama-3.3-70b",
+        "fresedgpt": "llama-3.3-70b",
+    },
+    "DeepSeek V3": {
+        "pollinations": "deepseek",
+        "cablyai": "deepseek-v3",
+        "fresedgpt": "deepseek-v3",
+    },
 }
 DEFAULT_MODEL = "GPT-4.1 mini"
 
-SYSTEM_PROMPT = (
-    "You are ChatGPT, a large language model trained by OpenAI. "
-    "Follow the user's instructions carefully. Respond using markdown when appropriate. "
-    "Be concise yet thorough."
-)
+# Short system prompt → faster time-to-first-token
+SYSTEM_PROMPT = "You are ChatGPT. Be helpful, accurate, and concise. Use markdown."
+
+# ──────────────────────────────────────────────
+# Provider configs (all free, no API key)
+# ──────────────────────────────────────────────
+PROVIDERS = [
+    {
+        "name": "pollinations",
+        "base_url": "https://text.pollinations.ai/openai",
+        "api_key": "pollinations",
+    },
+    {
+        "name": "cablyai",
+        "base_url": "https://cablyai.com/v1",
+        "api_key": "sk-free-cably",
+    },
+    {
+        "name": "fresedgpt",
+        "base_url": "https://fresedgpt.space/v1",
+        "api_key": "fresed-free",
+    },
+]
 
 # ──────────────────────────────────────────────
 # Session-state initialisation
@@ -257,16 +291,57 @@ def _auto_title(messages: list) -> str:
 
 
 # ──────────────────────────────────────────────
-# Pollinations AI client (completely free, no API key)
+# Clients (fast timeouts, connection pooling)
 # ──────────────────────────────────────────────
 @st.cache_resource
-def _get_client():
-    """Return an OpenAI-compatible client pointed at Pollinations AI.
-    Completely free — no API key, no sign-up, no rate-limit worries."""
-    return OpenAI(
-        base_url="https://text.pollinations.ai/openai",
-        api_key="pollinations",  # required by SDK but not validated
+def _get_clients():
+    """Build one OpenAI client per provider with aggressive timeouts."""
+    clients = []
+    for p in PROVIDERS:
+        c = OpenAI(
+            base_url=p["base_url"],
+            api_key=p["api_key"],
+            timeout=httpx.Timeout(15.0, connect=5.0),
+            max_retries=0,  # we handle retries ourselves
+        )
+        clients.append((p["name"], c))
+    return clients
+
+
+# ──────────────────────────────────────────────
+# Response cache for repeated questions
+# ──────────────────────────────────────────────
+if "cache" not in st.session_state:
+    st.session_state.cache = {}  # hash -> response text
+
+
+def _cache_key(model: str, msgs: list) -> str:
+    raw = model + "|" + "|".join(
+        m["role"] + ":" + m["content"] for m in msgs
     )
+    return hashlib.md5(raw.encode()).hexdigest()
+
+
+def _stream_with_fallback(model_key: str, api_messages: list):
+    """Try each provider in order; return the first successful stream.
+    Falls back automatically if a provider is slow or errors."""
+    clients = _get_clients()
+    last_error = None
+    for provider_name, client in clients:
+        model_id = MODELS[model_key].get(provider_name)
+        if not model_id:
+            continue
+        try:
+            stream = client.chat.completions.create(
+                model=model_id,
+                messages=api_messages,
+                stream=True,
+            )
+            return stream
+        except Exception as e:
+            last_error = e
+            continue
+    raise last_error or RuntimeError("All providers failed.")
 
 
 # ──────────────────────────────────────────────
@@ -415,7 +490,6 @@ if prompt:
         st.markdown(prompt)
 
     # Generate assistant response
-    client = _get_client()
     with st.chat_message("assistant"):
         api_messages = [
             {"role": "system", "content": SYSTEM_PROMPT}
@@ -423,21 +497,31 @@ if prompt:
             {"role": m["role"], "content": m["content"]}
             for m in messages
         ]
-        try:
-            stream = client.chat.completions.create(
-                model=MODELS[conv["model"]],
-                messages=api_messages,
-                stream=True,
-            )
-            response = st.write_stream(stream)
+
+        # Check cache first — instant response for repeated questions
+        ck = _cache_key(conv["model"], api_messages)
+        cached = st.session_state.cache.get(ck)
+        if cached:
+            st.markdown(cached)
             messages.append(
-                {"role": "assistant", "content": response}
+                {"role": "assistant", "content": cached}
             )
-        except Exception as e:
-            st.error(
-                f"❌ Something went wrong. Please try again.\n\n"
-                f"Details: {e}"
-            )
+        else:
+            try:
+                stream = _stream_with_fallback(
+                    conv["model"], api_messages
+                )
+                response = st.write_stream(stream)
+                messages.append(
+                    {"role": "assistant", "content": response}
+                )
+                # Cache the response
+                st.session_state.cache[ck] = response
+            except Exception as e:
+                st.error(
+                    f"❌ Something went wrong. Please try again.\n\n"
+                    f"Details: {e}"
+                )
 
 # ──────────────────────────────────────────────
 # Footer

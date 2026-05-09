@@ -1,4 +1,4 @@
-# 📦 Streamlit App Starter Kit 
+# 📦 GPT
 ```
 ⬆️ (Replace above with your app's name)
 ```

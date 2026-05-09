@@ -1,5 +1,5 @@
 import streamlit as st
-from g4f.client import Client
+from openai import OpenAI
 import uuid
 
 # ──────────────────────────────────────────────
@@ -202,12 +202,14 @@ hr {
 # Available models
 # ──────────────────────────────────────────────
 MODELS = {
-    "GPT-4o": "gpt-4o",
-    "GPT-4o mini": "gpt-4o-mini",
-    "GPT-4": "gpt-4",
-    "GPT-3.5 Turbo": "gpt-3.5-turbo",
+    "GPT-4.1 mini": "openai",
+    "GPT-4.1": "openai-large",
+    "Llama 3.3 70B": "llama",
+    "Mistral Large": "mistral-large",
+    "DeepSeek V3": "deepseek",
+    "DeepSeek R1": "deepseek-r1",
 }
-DEFAULT_MODEL = "GPT-4o mini"
+DEFAULT_MODEL = "GPT-4.1 mini"
 
 SYSTEM_PROMPT = (
     "You are ChatGPT, a large language model trained by OpenAI. "
@@ -255,12 +257,16 @@ def _auto_title(messages: list) -> str:
 
 
 # ──────────────────────────────────────────────
-# g4f client (no API key needed)
+# Pollinations AI client (completely free, no API key)
 # ──────────────────────────────────────────────
 @st.cache_resource
 def _get_client():
-    """Return a g4f Client — works without any API key."""
-    return Client()
+    """Return an OpenAI-compatible client pointed at Pollinations AI.
+    Completely free — no API key, no sign-up, no rate-limit worries."""
+    return OpenAI(
+        base_url="https://text.pollinations.ai/openai",
+        api_key="pollinations",  # required by SDK but not validated
+    )
 
 
 # ──────────────────────────────────────────────
@@ -423,16 +429,9 @@ if prompt:
                 messages=api_messages,
                 stream=True,
             )
-            # Stream tokens to the UI in real time
-            full_response = st.write_stream(
-                token.choices[0].delta.content or ""
-                for token in stream
-                if token.choices
-                and token.choices[0].delta
-                and token.choices[0].delta.content
-            )
+            response = st.write_stream(stream)
             messages.append(
-                {"role": "assistant", "content": full_response}
+                {"role": "assistant", "content": response}
             )
         except Exception as e:
             st.error(
